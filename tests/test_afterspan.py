@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -65,6 +66,34 @@ class Transcripts(unittest.TestCase):
         self.assertEqual(s["status"], "unfinished")
         self.assertIsNone(S.duration_ms(s))
 
+    def test_resumed_claude_completes_original_call(self):
+        pair = self.cc_pair("resume", "mcp__a__b", NOW - 9, NOW - 6, {}, "timeout", err=True)
+        self.write("proj/a.jsonl", pair[:1])
+        self.write("proj/z.jsonl", pair)
+        (s,) = importers.claude_code(self.dir, days=1)
+        self.assertEqual(s["status"], "error")
+        self.assertEqual(s["attributes"]["mcp.session.id"], "a")
+        self.assertAlmostEqual(S.duration_ms(s), 3000, delta=2)
+
+    def test_output_only_resume_pairs_in_either_file_order(self):
+        pair = self.cc_pair("resume", "mcp__a__b", NOW - 9, NOW - 6, {}, "ok")
+        self.write("proj/a.jsonl", pair[1:])
+        self.write("proj/z.jsonl", pair[:1])
+        (s,) = importers.claude_code(self.dir, days=1)
+        self.assertEqual(s["status"], "ok")
+        self.assertAlmostEqual(S.duration_ms(s), 3000, delta=2)
+
+    def test_resumed_codex_completes_original_call(self):
+        call = {"timestamp": iso(NOW - 9), "type": "response_item", "payload": {
+            "type": "function_call", "name": "run", "namespace": "mcp__a", "call_id": "resume", "arguments": "{}"}}
+        result = {"timestamp": iso(NOW - 6), "type": "response_item", "payload": {
+            "type": "function_call_output", "call_id": "resume", "output": "Error: timeout"}}
+        self.write("a.jsonl", [call])
+        self.write("z.jsonl", [call, result])
+        (s,) = importers.codex(self.dir, days=1)
+        self.assertEqual(s["status"], "error")
+        self.assertAlmostEqual(S.duration_ms(s), 3000, delta=2)
+
     def test_codex(self):
         self.write("2026/11/03/rollout-x.jsonl", [
             {"timestamp": iso(NOW - 20), "type": "response_item", "payload": {"type": "function_call", "name": "js",
@@ -108,6 +137,42 @@ for line in sys.stdin:
 
 
 class Tap(unittest.TestCase):
+    def test_typed_ids_and_propagation_match_recorded_spans(self):
+        d = tempfile.mkdtemp()
+        out = os.path.join(d, "spans.jsonl")
+        server = '''import json,sys
+for line in sys.stdin:
+ m=json.loads(line)
+ print(json.dumps({"id":m["id"],"result":{"traceparent":m["params"]["_meta"]["traceparent"]}}),flush=True)
+'''
+        msgs = [{"id": ident, "method": "tools/call", "params": {"name": "echo"}} for ident in [1, "1"]]
+        p = subprocess.run([sys.executable, "-m", "afterspan", "tap", "--name", "fake", "--out", out,
+                            "--propagate", "--", sys.executable, "-c", server],
+                           input="".join(json.dumps(m) + "\n" for m in msgs), text=True, capture_output=True,
+                           timeout=15, cwd=ROOT)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = list(S.read(out))
+        replies = [json.loads(line) for line in p.stdout.splitlines()]
+        self.assertEqual(len({s["span_id"] for s in rows}), 2)
+        self.assertEqual([r["result"]["traceparent"].split("-")[2] for r in replies], [s["span_id"] for s in rows])
+
+    def test_final_response_survives_backpressure_longer_than_two_seconds(self):
+        d = tempfile.mkdtemp()
+        out = os.path.join(d, "spans.jsonl")
+        server = 'import json,sys; m=json.loads(sys.stdin.readline()); print(json.dumps({"id":m["id"],"result":"x"*262144}),flush=True)'
+        p = subprocess.Popen([sys.executable, "-m", "afterspan", "tap", "--name", "fake", "--out", out,
+                              "--", sys.executable, "-c", server], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, cwd=ROOT)
+        p.stdin.write(b'{"id":1,"method":"tools/call","params":{"name":"echo"}}\n')
+        p.stdin.close(); p.stdin = None
+        time.sleep(2.4)  # Simulate a client that temporarily stops draining its stdout pipe.
+        stdout, stderr = p.communicate(timeout=15)
+        self.assertEqual(p.returncode, 0, stderr)
+        self.assertEqual(len(json.loads(stdout)["result"]), 262144)
+        (s,) = S.read(out)
+        self.assertEqual(s["status"], "ok")
+        self.assertLess(S.duration_ms(s), 2000)
+
     def test_tap_forwards_and_records(self):
         d = tempfile.mkdtemp()
         srv, out = os.path.join(d, "srv.py"), os.path.join(d, "spans.jsonl")
@@ -140,6 +205,23 @@ class Collector(http.server.BaseHTTPRequestHandler):
 
 
 class Otlp(unittest.TestCase):
+    def test_partial_export_counts_accepted_without_replay(self):
+        rows = [S.make("a" * 32, str(i), "mcp__srv__tool", int(NOW * 1e9), int(NOW * 1e9), source="tap")
+                for i in range(5)]
+        def response(body):
+            r = mock.MagicMock()
+            r.__enter__.return_value = r
+            r.status = 200
+            r.read.return_value = json.dumps(body).encode()
+            return r
+        with mock.patch("urllib.request.urlopen", side_effect=[response({}), response({"partialSuccess": {
+                "rejectedSpans": "1", "errorMessage": "capacity"}})]) as send:
+            with self.assertRaises(otlp.PartialExportError) as caught:
+                otlp.send(rows, "http://collector.invalid", batch=2)
+        self.assertEqual((caught.exception.accepted, caught.exception.rejected), (3, 1))
+        self.assertEqual(caught.exception.collector_message, "capacity")
+        self.assertEqual(send.call_count, 2)
+
     def test_export_shape(self):
         httpd = http.server.HTTPServer(("127.0.0.1", 0), Collector)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()

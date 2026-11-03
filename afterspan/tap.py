@@ -16,12 +16,16 @@ from . import spans as S
 
 
 def run(cmd, name, out, propagate=False):
-    child = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+    child = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     assert child.stdin and child.stdout
     cin, cout = child.stdin, child.stdout
     trace = S.hex_id("tap", name, os.getpid(), time.time_ns(), n=32)
     pending, lock = {}, threading.Lock()
+    forwarding_failed = threading.Event()
     sink = open(out, "a", buffering=1)
+
+    def call_key(value):
+        return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
     def record(span):
         with lock:
@@ -36,13 +40,13 @@ def run(cmd, name, out, propagate=False):
                 changed = False
                 for m in (msgs if batch else [msgs]):
                     if isinstance(m, dict) and "method" in m and "id" in m:
-                        params = m.get("params") or {}
+                        params = m.get("params") if isinstance(m.get("params"), dict) else {}
                         tool = params.get("name") if m["method"] == "tools/call" else m["method"].split("/")[-1]
                         with lock:
-                            pending[json.dumps(m["id"])] = (m["method"], tool, time.time_ns(), params.get("arguments"))
+                            pending[call_key(m["id"])] = (m["method"], tool, time.time_ns(), params.get("arguments"))
                         if propagate and isinstance(m.get("params", {}), dict):
                             m.setdefault("params", {}).setdefault("_meta", {})["traceparent"] = \
-                                f"00-{trace}-{S.hex_id(trace, m['id'])}-01"
+                                f"00-{trace}-{S.hex_id(trace, call_key(m['id']))}-01"
                             changed = True
                 if changed:
                     line = (json.dumps(msgs, separators=(",", ":")) + "\n").encode()
@@ -53,7 +57,13 @@ def run(cmd, name, out, propagate=False):
 
     def downstream():  # server -> client
         for raw in cout:
-            sys.stdout.buffer.write(raw); sys.stdout.buffer.flush()
+            received_at = time.time_ns()
+            if not forwarding_failed.is_set():
+                try:
+                    sys.stdout.buffer.write(raw); sys.stdout.buffer.flush()
+                except BrokenPipeError:
+                    # Keep draining the child so it can finish even after the client disconnects.
+                    forwarding_failed.set()
             try:
                 msgs = json.loads(raw)
             except ValueError:
@@ -62,24 +72,24 @@ def run(cmd, name, out, propagate=False):
                 if not isinstance(m, dict) or "id" not in m or "method" in m:
                     continue
                 with lock:
-                    hit = pending.pop(json.dumps(m["id"]), None)
+                    hit = pending.pop(call_key(m["id"]), None)
                 if not hit:
                     continue
                 method, tool, t0, args = hit
                 res = m.get("result")
                 err = "error" in m or (isinstance(res, dict) and res.get("isError") is True)
                 body = m.get("error") if "error" in m else res
-                record(S.make(trace, str(m["id"]), tool or method, t0, time.time_ns(), source="tap", args=args,
+                record(S.make(trace, call_key(m["id"]), tool or method, t0, received_at, source="tap", args=args,
                               result=body, is_error=err, method=method, server=name))
 
     up = threading.Thread(target=upstream, daemon=True)
     down = threading.Thread(target=downstream, daemon=True)
     up.start(); down.start()
     rc = child.wait()
-    down.join(timeout=2)
+    down.join()
     with lock:
         for k, (method, tool, t0, args) in pending.items():
             sink.write(json.dumps(S.make(trace, k, tool or method, t0, None, source="tap", args=args, method=method,
                                          server=name), separators=(",", ":")) + "\n")
     sink.close()
-    return rc
+    return rc or int(forwarding_failed.is_set())

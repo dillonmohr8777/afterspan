@@ -65,7 +65,11 @@ def main(argv=None):
             ap.error("tap needs a server command after --")
         return tap.run(cmd, a.name, a.out, a.propagate)
     elif a.cmd == "export":
-        print(json.dumps({"sent": otlp.send(list(spans.read(a.file)), a.endpoint, a.service)}))
+        try:
+            print(json.dumps({"sent": otlp.send(list(spans.read(a.file)), a.endpoint, a.service)}))
+        except otlp.PartialExportError as exc:
+            print(json.dumps({"sent": exc.accepted, "rejected": exc.rejected, "error": exc.collector_message}), file=sys.stderr)
+            return 1
     return 0
 
 

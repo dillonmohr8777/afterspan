@@ -10,6 +10,12 @@ import urllib.request
 STATUS = {"ok": 1, "error": 2, "unfinished": 0}
 
 
+class PartialExportError(RuntimeError):
+    def __init__(self, accepted, rejected, message):
+        self.accepted, self.rejected, self.collector_message = accepted, rejected, message
+        super().__init__(f"collector accepted {accepted} spans and rejected {rejected}: {message}")
+
+
 def _val(v):
     if isinstance(v, bool):
         return {"boolValue": v}
@@ -48,5 +54,12 @@ def send(spans, endpoint, service="afterspan", batch=500):
         with urllib.request.urlopen(req, timeout=30) as r:
             if r.status >= 300:
                 raise RuntimeError(f"collector answered HTTP {r.status}")
+            response = json.loads(r.read() or b"{}")
+            partial = response.get("partialSuccess") or {}
+            rejected = int(partial.get("rejectedSpans", 0))
+            if rejected < 0 or rejected > len(chunk):
+                raise RuntimeError("collector returned an invalid rejectedSpans count")
+            if rejected:
+                raise PartialExportError(sent + len(chunk) - rejected, rejected, partial.get("errorMessage", ""))
         sent += len(chunk)
     return sent

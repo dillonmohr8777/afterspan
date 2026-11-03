@@ -48,12 +48,32 @@ def _text(content):
     return json.dumps(content, default=str) if content is not None else ""
 
 
+def _result(t, body, error):
+    # Reconciliation may span many files. Retain measurements, never raw result bodies.
+    return {"end_ns": t, "bytes": S.size(body), "error": S.error_type(body) if error else None}
+
+
+def _reconcile(calls, results, days):
+    """Pair across all files before deciding that a call never completed."""
+    out = []
+    for cid, span in calls.items():
+        result = results.get(cid)
+        if result:
+            span["end_ns"] = result["end_ns"]
+            span["attributes"]["mcp.response.bytes"] = result["bytes"]
+            if result["end_ns"] is not None:
+                span["status"] = "error" if result["error"] else "ok"
+                if result["error"]:
+                    span["attributes"]["error.type"] = result["error"]
+        out.append(span)
+    return _recent(out, days)
+
+
 def claude_code(root="~/.claude/projects", days=30, mcp_only=True, harness=False):
-    seen, out = set(), []
+    calls, results = {}, {}
     for f in _files(root, "**/*.jsonl", days):
         session = os.path.splitext(os.path.basename(f))[0]
         trace = S.hex_id("claude-code", session, n=32)
-        pending = {}
         try:
             lines = open(f, errors="replace")
         except OSError:
@@ -73,30 +93,24 @@ def claude_code(root="~/.claude/projects", days=30, mcp_only=True, harness=False
                 for c in content:
                     if not isinstance(c, dict):
                         continue
-                    if c.get("type") == "tool_use" and c.get("id") not in seen:
+                    if c.get("type") == "tool_use" and c.get("id") not in calls:
                         name = c.get("name") or ""
                         if not _keep(name, mcp_only, harness):
                             continue
-                        pending[c["id"]] = (name, t, c.get("input"))
-                    elif c.get("type") == "tool_result" and c.get("tool_use_id") in pending:
+                        calls[c["id"]] = S.make(trace, c["id"], name, t, None, source="claude-code",
+                                               args=c.get("input"), session=session)
+                    elif c.get("type") == "tool_result":
                         cid = c["tool_use_id"]
-                        name, t0, args = pending.pop(cid)
-                        seen.add(cid)
-                        out.append(S.make(trace, cid, name, t0, t, source="claude-code", args=args,
-                                          result=_text(c.get("content")), is_error=bool(c.get("is_error")), session=session))
-        for cid, (name, t0, args) in pending.items():
-            if cid not in seen:
-                seen.add(cid)
-                out.append(S.make(trace, cid, name, t0, None, source="claude-code", args=args, session=session))
-    return _recent(out, days)
+                        if cid not in results or (results[cid]["end_ns"] is None and t is not None):
+                            results[cid] = _result(t, _text(c.get("content")), bool(c.get("is_error")))
+    return _reconcile(calls, results, days)
 
 
 def codex(root="~/.codex/sessions", days=30, mcp_only=True, harness=False):
-    seen, out = set(), []
+    calls, results = {}, {}
     for f in _files(root, "**/*.jsonl", days):
         session = os.path.splitext(os.path.basename(f))[0]
         trace = S.hex_id("codex", session, n=32)
-        pending = {}
         try:
             lines = open(f, errors="replace")
         except OSError:
@@ -111,21 +125,17 @@ def codex(root="~/.codex/sessions", days=30, mcp_only=True, harness=False):
                     continue
                 p = d.get("payload") or {}
                 t = S.ts_ns(d.get("timestamp"))
-                if p.get("type") == "function_call" and p.get("call_id") not in seen:
+                if p.get("type") == "function_call" and p.get("call_id") not in calls:
                     ns = p.get("namespace") or ""
                     full = f"{ns}__{p.get('name')}" if ns.startswith("mcp__") else (p.get("name") or "")
                     if not _keep(full, mcp_only, harness):
                         continue
-                    pending[p["call_id"]] = (full, t, p.get("arguments"))
-                elif p.get("type") == "function_call_output" and p.get("call_id") in pending:
+                    calls[p["call_id"]] = S.make(trace, p["call_id"], full, t, None, source="codex",
+                                                args=p.get("arguments"), session=session)
+                elif p.get("type") == "function_call_output":
                     cid = p["call_id"]
-                    full, t0, args = pending.pop(cid)
-                    seen.add(cid)
                     text = _text(p.get("output"))
                     err = text.lstrip().lower().startswith(("error", "tool call error", "mcp error")) or '"is_error": true' in text
-                    out.append(S.make(trace, cid, full, t0, t, source="codex", args=args, result=text, is_error=err, session=session))
-        for cid, (full, t0, args) in pending.items():
-            if cid not in seen:
-                seen.add(cid)
-                out.append(S.make(trace, cid, full, t0, None, source="codex", args=args, session=session))
-    return _recent(out, days)
+                    if cid not in results or (results[cid]["end_ns"] is None and t is not None):
+                        results[cid] = _result(t, text, err)
+    return _reconcile(calls, results, days)
