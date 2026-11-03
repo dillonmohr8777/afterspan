@@ -15,6 +15,21 @@ import time
 from . import spans as S
 
 
+def input_lines(fd):
+    """Read chunks without holding stdin's buffered-reader lock during interpreter shutdown."""
+    pending = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            if pending:
+                yield pending
+            return
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            yield line + b"\n"
+
+
 def run(cmd, name, out, propagate=False):
     child = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     assert child.stdin and child.stdout
@@ -32,7 +47,7 @@ def run(cmd, name, out, propagate=False):
             sink.write(json.dumps(span, separators=(",", ":")) + "\n")
 
     def upstream():  # client -> server
-        for raw in sys.stdin.buffer:
+        for raw in input_lines(sys.stdin.fileno()):
             line = raw
             try:
                 msgs = json.loads(raw)
@@ -52,8 +67,14 @@ def run(cmd, name, out, propagate=False):
                     line = (json.dumps(msgs, separators=(",", ":")) + "\n").encode()
             except (ValueError, TypeError):
                 pass
-            cin.write(line); cin.flush()
-        cin.close()
+            try:
+                cin.write(line); cin.flush()
+            except BrokenPipeError:
+                return
+        try:
+            cin.close()
+        except BrokenPipeError:
+            pass
 
     def downstream():  # server -> client
         for raw in cout:

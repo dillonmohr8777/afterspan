@@ -137,6 +137,23 @@ for line in sys.stdin:
 
 
 class Tap(unittest.TestCase):
+    def test_server_can_exit_while_client_keeps_input_open(self):
+        d = tempfile.mkdtemp()
+        out = os.path.join(d, "spans.jsonl")
+        server = 'import json,sys; m=json.loads(sys.stdin.readline()); print(json.dumps({"id":m["id"],"result":"ok"}),flush=True)'
+        p = subprocess.Popen([sys.executable, "-m", "afterspan", "tap", "--name", "fake", "--out", out,
+                              "--", sys.executable, "-c", server], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, cwd=ROOT)
+        p.stdin.write(b'{"id":1,"method":"tools/call","params":{"name":"echo"}}\n'); p.stdin.flush()
+        try:
+            rc = p.wait(timeout=10)
+        finally:
+            p.stdin.close(); p.stdin = None
+        stdout, stderr = p.communicate(timeout=10)
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(json.loads(stdout)["result"], "ok")
+        self.assertEqual(list(S.read(out))[0]["status"], "ok")
+
     def test_typed_ids_and_propagation_match_recorded_spans(self):
         d = tempfile.mkdtemp()
         out = os.path.join(d, "spans.jsonl")
