@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "afterspan"
+version = "0.1.0"
+description = "OpenTelemetry traces for MCP, rebuilt from the agent transcripts you already have"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+classifiers = ["Programming Language :: Python :: 3", "License :: OSI Approved :: MIT License", "Topic :: System :: Monitoring"]
+
+[project.scripts]
+afterspan = "afterspan.cli:main"
+
+[tool.setuptools]
+packages = ["afterspan"]
