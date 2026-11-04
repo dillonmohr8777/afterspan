@@ -5,15 +5,17 @@ Headers for hosted backends come from OTEL_EXPORTER_OTLP_HEADERS ("key=value,key
 """
 import json
 import os
+import urllib.error
+import urllib.parse
 import urllib.request
 
 STATUS = {"ok": 1, "error": 2, "unfinished": 0}
 
 
 class PartialExportError(RuntimeError):
-    def __init__(self, accepted, rejected, message):
-        self.accepted, self.rejected, self.collector_message = accepted, rejected, message
-        super().__init__(f"collector accepted {accepted} spans and rejected {rejected}: {message}")
+    def __init__(self, accepted, rejected, message, unsent=0):
+        self.accepted, self.rejected, self.collector_message, self.unsent = accepted, rejected, message, unsent
+        super().__init__(f"collector accepted {accepted} spans, rejected {rejected}, unsent {unsent}: {message}")
 
 
 def _val(v):
@@ -46,20 +48,30 @@ def send(spans, endpoint, service="afterspan", batch=500):
     headers = {"content-type": "application/json"}
     for pair in filter(None, os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "").split(",")):
         k, _, v = pair.partition("=")
-        headers[k.strip()] = v.strip()
+        if k.strip():
+            headers[urllib.parse.unquote(k.strip())] = urllib.parse.unquote(v.strip())
     sent, spans = 0, [s for s in spans if s.get("start_ns")]
-    for i in range(0, len(spans), batch):
+    total = len(spans)
+    for i in range(0, total, batch):
         chunk = spans[i:i + batch]
         req = urllib.request.Request(url, data=json.dumps(payload(chunk, service)).encode(), headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=30) as r:
-            if r.status >= 300:
-                raise RuntimeError(f"collector answered HTTP {r.status}")
-            response = json.loads(r.read() or b"{}")
-            partial = response.get("partialSuccess") or {}
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                if r.status >= 300:
+                    raise RuntimeError(f"collector answered HTTP {r.status}")
+                response = json.loads(r.read() or b"{}")
+        except (urllib.error.URLError, OSError, RuntimeError, ValueError) as exc:
+            raise PartialExportError(sent, 0, str(exc), total - sent) from exc
+        partial = response.get("partialSuccess") or {}
+        try:
             rejected = int(partial.get("rejectedSpans", 0))
-            if rejected < 0 or rejected > len(chunk):
-                raise RuntimeError("collector returned an invalid rejectedSpans count")
-            if rejected:
-                raise PartialExportError(sent + len(chunk) - rejected, rejected, partial.get("errorMessage", ""))
+        except (TypeError, ValueError):
+            rejected = -1
+        if rejected < 0 or rejected > len(chunk):
+            raise PartialExportError(sent, 0, "collector returned an invalid rejectedSpans count", total - sent)
+        if rejected:
+            accepted = sent + len(chunk) - rejected
+            raise PartialExportError(accepted, rejected, partial.get("errorMessage", ""),
+                                     total - sent - len(chunk))
         sent += len(chunk)
     return sent

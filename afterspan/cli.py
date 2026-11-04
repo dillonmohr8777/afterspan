@@ -68,7 +68,7 @@ def main(argv=None):
         try:
             print(json.dumps({"sent": otlp.send(list(spans.read(a.file)), a.endpoint, a.service)}))
         except otlp.PartialExportError as exc:
-            print(json.dumps({"sent": exc.accepted, "rejected": exc.rejected, "error": exc.collector_message}), file=sys.stderr)
+            print(json.dumps({"sent": exc.accepted, "rejected": exc.rejected, "unsent": exc.unsent, "error": exc.collector_message}), file=sys.stderr)
             return 1
     return 0
 

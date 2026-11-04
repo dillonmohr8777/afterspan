@@ -7,6 +7,7 @@ each request's params._meta (MCP SEP-414) so a server that reads it can join the
 """
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -103,14 +104,45 @@ def run(cmd, name, out, propagate=False):
                 record(S.make(trace, call_key(m["id"]), tool or method, t0, received_at, source="tap", args=args,
                               result=body, is_error=err, method=method, server=name))
 
+    def forward(signum, _frame):
+        try:
+            child.send_signal(signum)
+        except (OSError, ValueError):
+            pass
+
+    old_handlers = {}
+    for sig in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):
+        if sig is None:
+            continue
+        try:
+            old_handlers[sig] = signal.signal(sig, forward)
+        except ValueError:  # not the main thread; cannot install handlers
+            break
+
     up = threading.Thread(target=upstream, daemon=True)
     down = threading.Thread(target=downstream, daemon=True)
-    up.start(); down.start()
-    rc = child.wait()
-    down.join()
-    with lock:
-        for k, (method, tool, t0, args) in pending.items():
-            sink.write(json.dumps(S.make(trace, k, tool or method, t0, None, source="tap", args=args, method=method,
-                                         server=name), separators=(",", ":")) + "\n")
-    sink.close()
+    rc = 1
+    try:
+        up.start(); down.start()
+        rc = child.wait()
+        down.join()
+    finally:
+        if child.poll() is None:  # abnormal tap exit: do not orphan the server
+            try:
+                child.terminate()
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+            except OSError:
+                pass
+            down.join(timeout=2)
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+        with lock:
+            for k, (method, tool, t0, args) in pending.items():
+                sink.write(json.dumps(S.make(trace, k, tool or method, t0, None, source="tap", args=args, method=method,
+                                             server=name), separators=(",", ":")) + "\n")
+            pending.clear()
+        sink.close()
     return rc or int(forwarding_failed.is_set())

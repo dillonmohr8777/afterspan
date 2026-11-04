@@ -48,6 +48,40 @@ def _text(content):
     return json.dumps(content, default=str) if content is not None else ""
 
 
+def _flag_error(obj, depth=0):
+    """True/False when a structured error flag is present, else None."""
+    if isinstance(obj, str):
+        s = obj.strip()
+        if not s[:1] in ("{", "["):
+            return None
+        try:
+            obj = json.loads(s)
+        except ValueError:
+            return None
+    if isinstance(obj, list) and depth < 2:
+        found = [_flag_error(x, depth + 1) for x in obj]
+        return True if any(f is True for f in found) else (False if any(f is False for f in found) else None)
+    if not isinstance(obj, dict):
+        return None
+    for key in ("isError", "is_error"):
+        if key in obj and isinstance(obj[key], bool):
+            return obj[key]
+    if depth < 2:
+        for key in ("result", "output", "content"):
+            if key in obj:
+                inner = _flag_error(obj[key], depth + 1)
+                if inner is not None:
+                    return inner
+    return None
+
+
+def _codex_error(raw, text):
+    flag = _flag_error(raw)
+    if flag is not None:
+        return flag
+    return " ".join(text.lstrip().lower().split()).startswith(("error", "tool call error", "mcp error"))
+
+
 def _result(t, body, error):
     # Reconciliation may span many files. Retain measurements, never raw result bodies.
     return {"end_ns": t, "bytes": S.size(body), "error": S.error_type(body) if error else None}
@@ -134,8 +168,9 @@ def codex(root="~/.codex/sessions", days=30, mcp_only=True, harness=False):
                                                 args=p.get("arguments"), session=session)
                 elif p.get("type") == "function_call_output":
                     cid = p["call_id"]
-                    text = _text(p.get("output"))
-                    err = text.lstrip().lower().startswith(("error", "tool call error", "mcp error")) or '"is_error": true' in text
+                    raw_out = p.get("output")
+                    text = _text(raw_out)
+                    err = _codex_error(raw_out, text)
                     if cid not in results or (results[cid]["end_ns"] is None and t is not None):
                         results[cid] = _result(t, text, err)
     return _reconcile(calls, results, days)
