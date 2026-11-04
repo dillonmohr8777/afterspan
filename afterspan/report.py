@@ -87,7 +87,7 @@ def html_page(by_server, by_tool, title="afterspan"):
     errs = sum(r["errors"] for r in by_server["rows"])
     fix = worst(by_tool)
     fixes = "".join(f"<li><b>{html.escape(r['key'])}</b>: {r['errors']} errors in {r['calls']} calls "
-                    f"({html.escape(', '.join(r['error_types']))}), p95 {r['p95_ms']:,.0f} ms</li>" for r in fix if r["errors"])
+                    f"({html.escape(', '.join(r['error_types']))}), p95 {'-' if r['p95_ms'] is None else format(r['p95_ms'], ',.0f') + ' ms'}</li>" for r in fix if r["errors"])
     return (f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{html.escape(title)}</title>"
             f"<style>{CSS}</style><main><h1>{html.escape(title)}</h1><p class=m>{by_server['from']} to {by_server['to']} · "
             f"rebuilt from agent transcripts and taps · {html.escape(json.dumps(by_server['sources']))}</p>"

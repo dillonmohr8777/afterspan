@@ -106,6 +106,28 @@ class Transcripts(unittest.TestCase):
         self.assertEqual((s["attributes"]["mcp.server.name"], s["attributes"]["gen_ai.tool.name"], s["status"]), ("repl", "js", "ok"))
         self.assertEqual(s["attributes"]["mcp.request.argument_keys"], ["code"])
 
+    def test_codex_mcp_tool_call_events(self):
+        def done(cid, tool, status, text, start, dur_ms):
+            return {"timestamp": iso(start + dur_ms / 1000), "type": "event_msg", "payload": {
+                "type": "item_completed", "item": {
+                    "type": "McpToolCall", "id": cid, "server": "computer-use", "tool": tool, "status": status,
+                    "arguments": {"app": "x"}, "started_at_ms": int(start * 1000), "duration_ms": dur_ms,
+                    "result": {"content": [{"type": "text", "text": text}]}}}}
+        self.write("2026/11/03/rollout-y.jsonl", [
+            {"timestamp": iso(NOW - 20), "type": "response_item", "payload": {
+                "type": "function_call", "name": "click", "namespace": "mcp__computer-use", "call_id": "m1", "arguments": "{}"}},
+            {"timestamp": iso(NOW - 18), "type": "response_item", "payload": {
+                "type": "function_call_output", "call_id": "m1", "output": [{"type": "input_text", "text": "Wall time: 2s"}]}},
+            done("m1", "click", "failed", "Computer Use server error -10005: timeoutReached", NOW - 20, 2000),
+            done("m2", "list_apps", "completed", "ok", NOW - 15, 500)])
+        out = {s["attributes"]["gen_ai.tool.call.id"]: s for s in importers.codex(self.dir, days=1)}
+        self.assertEqual(sorted(out), ["m1", "m2"])
+        self.assertEqual((out["m1"]["status"], out["m1"]["attributes"]["error.type"]), ("error", "timeout"))
+        self.assertEqual(out["m1"]["attributes"]["mcp.server.name"], "computer-use")
+        self.assertEqual(out["m1"]["attributes"]["gen_ai.tool.name"], "click")
+        self.assertAlmostEqual(S.duration_ms(out["m1"]), 2000, delta=2)
+        self.assertEqual(out["m2"]["status"], "ok")
+
 
 class Report(unittest.TestCase):
     def test_percentiles_and_worst(self):
@@ -120,6 +142,12 @@ class Report(unittest.TestCase):
         page = report.html_page(report.summarize(rows), s)
         self.assertIn("Fix first", page)
         self.assertIn("prefers-color-scheme:dark", page)
+
+    def test_fix_first_without_p95(self):
+        rows = [S.make("t" * 32, f"c{i}", "mcp__srv__tool", None, int(NOW * 1e9), source="codex", is_error=i == 0, result="x")
+                for i in range(10)]
+        page = report.html_page(report.summarize(rows), report.summarize(rows, "tool"))
+        self.assertIn("p95 -</li>", page)
 
 
 FAKE_SERVER = r'''

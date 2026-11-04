@@ -43,9 +43,25 @@ def run(cmd, name, out, propagate=False):
     def call_key(value):
         return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
+    recording = [True]
+
+    def write_span(span):
+        """Caller holds lock. A recording failure must never stop forwarding: disable recording and say so."""
+        if not recording[0]:
+            return
+        try:
+            sink.write(json.dumps(span, separators=(",", ":")) + "\n")
+        except OSError as e:
+            recording[0] = False
+            try:
+                sys.stderr.write(f"afterspan: recording to {out} failed ({e}); continuing without recording\n")
+                sys.stderr.flush()
+            except (OSError, ValueError):
+                pass
+
     def record(span):
         with lock:
-            sink.write(json.dumps(span, separators=(",", ":")) + "\n")
+            write_span(span)
 
     def upstream():  # client -> server
         for raw in input_lines(sys.stdin.fileno()):
@@ -141,8 +157,11 @@ def run(cmd, name, out, propagate=False):
             signal.signal(sig, handler)
         with lock:
             for k, (method, tool, t0, args) in pending.items():
-                sink.write(json.dumps(S.make(trace, k, tool or method, t0, None, source="tap", args=args, method=method,
-                                             server=name), separators=(",", ":")) + "\n")
+                write_span(S.make(trace, k, tool or method, t0, None, source="tap", args=args, method=method,
+                                  server=name))
             pending.clear()
-        sink.close()
+        try:
+            sink.close()
+        except OSError:
+            pass
     return rc or int(forwarding_failed.is_set())

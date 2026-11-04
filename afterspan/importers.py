@@ -140,8 +140,47 @@ def claude_code(root="~/.claude/projects", days=30, mcp_only=True, harness=False
     return _reconcile(calls, results, days)
 
 
+def _item_duration_ns(item):
+    for key in ("duration_ms", "durationMs"):
+        v = item.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return int(v * 1e6)
+    d = item.get("duration")
+    if isinstance(d, bool):
+        return None
+    if isinstance(d, (int, float)):
+        return int(d * 1e6)
+    if isinstance(d, dict) and isinstance(d.get("secs"), (int, float)):
+        return int(d["secs"] * 1e9 + (d.get("nanos") or 0))
+    return None
+
+
+def _mcp_tool_call(item, t, trace, session, mcp_only, harness):
+    """An event_msg item_completed McpToolCall -> (id, span, result), or None."""
+    cid = item.get("id")
+    if not cid:
+        return None
+    full = f"mcp__{item.get('server')}__{item.get('tool')}"
+    if not _keep(full, mcp_only, harness):
+        return None
+    start = item.get("started_at_ms")
+    start = int(start * 1e6) if isinstance(start, (int, float)) and not isinstance(start, bool) else t
+    dur = _item_duration_ns(item)
+    end = start + dur if start is not None and dur is not None else t
+    res = item.get("result")
+    if isinstance(res, dict) and isinstance(res.get("Ok"), dict):
+        res = res["Ok"]
+    err = item.get("status") == "failed" or (isinstance(res, dict) and res.get("isError") is True)
+    body = _text(res.get("content") if isinstance(res, dict) and "content" in res else res)
+    if err and item.get("error") is not None:
+        body = f"{body} {_text(item['error'].get('message') if isinstance(item['error'], dict) else item['error'])}".strip()
+    span = S.make(trace, cid, full, start, None, source="codex", args=item.get("arguments"), session=session)
+    return cid, span, _result(end, body, err)
+
+
 def codex(root="~/.codex/sessions", days=30, mcp_only=True, harness=False):
     calls, results = {}, {}
+    items = {}  # McpToolCall events by id; their status takes precedence over function_call/output pairs
     for f in _files(root, "**/*.jsonl", days):
         session = os.path.splitext(os.path.basename(f))[0]
         trace = S.hex_id("codex", session, n=32)
@@ -151,15 +190,23 @@ def codex(root="~/.codex/sessions", days=30, mcp_only=True, harness=False):
             continue
         with lines:
             for line in lines:
-                if '"function_call' not in line:
+                if '"function_call' not in line and "McpToolCall" not in line:
                     continue
                 try:
                     d = json.loads(line)
                 except ValueError:
                     continue
                 p = d.get("payload") or {}
+                if not isinstance(p, dict):
+                    continue
                 t = S.ts_ns(d.get("timestamp"))
-                if p.get("type") == "function_call" and p.get("call_id") not in calls:
+                if p.get("type") == "item_completed":
+                    item = p.get("item")
+                    if isinstance(item, dict) and item.get("type") == "McpToolCall":
+                        got = _mcp_tool_call(item, t, trace, session, mcp_only, harness)
+                        if got and got[0] not in items:
+                            items[got[0]] = got[1:]
+                elif p.get("type") == "function_call" and p.get("call_id") not in calls:
                     ns = p.get("namespace") or ""
                     full = f"{ns}__{p.get('name')}" if ns.startswith("mcp__") else (p.get("name") or "")
                     if not _keep(full, mcp_only, harness):
@@ -173,4 +220,6 @@ def codex(root="~/.codex/sessions", days=30, mcp_only=True, harness=False):
                     err = _codex_error(raw_out, text)
                     if cid not in results or (results[cid]["end_ns"] is None and t is not None):
                         results[cid] = _result(t, text, err)
+    for cid, (span, result) in items.items():
+        calls[cid], results[cid] = span, result
     return _reconcile(calls, results, days)
