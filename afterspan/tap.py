@@ -32,13 +32,17 @@ def input_lines(fd):
 
 
 def run(cmd, name, out, propagate=False):
-    child = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    sink = open(out, "a", buffering=1)  # open before spawning so a bad path cannot leave an unmanaged server
+    try:
+        child = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    except BaseException:
+        sink.close()
+        raise
     assert child.stdin and child.stdout
     cin, cout = child.stdin, child.stdout
     trace = S.hex_id("tap", name, os.getpid(), time.time_ns(), n=32)
     pending, lock = {}, threading.Lock()
     forwarding_failed = threading.Event()
-    sink = open(out, "a", buffering=1)
 
     def call_key(value):
         return json.dumps(value, separators=(",", ":"), sort_keys=True)

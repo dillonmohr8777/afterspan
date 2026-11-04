@@ -77,14 +77,18 @@ def _flag_error(obj, depth=0):
 
 def _codex_error(raw, text):
     flag = _flag_error(raw)
+    if flag is None:
+        flag = _flag_error(text)
     if flag is not None:
         return flag
     return " ".join(text.lstrip().lower().split()).startswith(("error", "tool call error", "mcp error"))
 
 
-def _result(t, body, error):
+def _result(t, body, error, measured=None):
     # Reconciliation may span many files. Retain measurements, never raw result bodies.
-    return {"end_ns": t, "bytes": S.size(body), "error": S.error_type(body) if error else None}
+    # `measured` is the original result before text extraction (images/resources included) for the byte count.
+    nbytes = S.size(body if measured is None else measured)
+    return {"end_ns": t, "bytes": nbytes, "error": S.error_type(body) if error else None}
 
 
 def _reconcile(calls, results, days):
@@ -136,7 +140,8 @@ def claude_code(root="~/.claude/projects", days=30, mcp_only=True, harness=False
                     elif c.get("type") == "tool_result":
                         cid = c["tool_use_id"]
                         if cid not in results or (results[cid]["end_ns"] is None and t is not None):
-                            results[cid] = _result(t, _text(c.get("content")), bool(c.get("is_error")))
+                            results[cid] = _result(t, _text(c.get("content")), bool(c.get("is_error")),
+                                                 c.get("content"))
     return _reconcile(calls, results, days)
 
 
@@ -164,18 +169,25 @@ def _mcp_tool_call(item, t, trace, session, mcp_only, harness):
     if not _keep(full, mcp_only, harness):
         return None
     start = item.get("started_at_ms")
-    start = int(start * 1e6) if isinstance(start, (int, float)) and not isinstance(start, bool) else t
+    has_start = isinstance(start, (int, float)) and not isinstance(start, bool)
     dur = _item_duration_ns(item)
-    end = start + dur if start is not None and dur is not None else t
+    if has_start:
+        start = int(start * 1e6)
+        end = start + dur if dur is not None else t
+    else:
+        end = t
+        start = t - dur if t is not None and dur is not None else t
+    timed = has_start or dur is not None
     res = item.get("result")
     if isinstance(res, dict) and isinstance(res.get("Ok"), dict):
         res = res["Ok"]
     err = item.get("status") == "failed" or (isinstance(res, dict) and res.get("isError") is True)
-    body = _text(res.get("content") if isinstance(res, dict) and "content" in res else res)
+    content = res.get("content") if isinstance(res, dict) and "content" in res else res
+    body = _text(content)
     if err and item.get("error") is not None:
         body = f"{body} {_text(item['error'].get('message') if isinstance(item['error'], dict) else item['error'])}".strip()
     span = S.make(trace, cid, full, start, None, source="codex", args=item.get("arguments"), session=session)
-    return cid, span, _result(end, body, err)
+    return cid, span, _result(end, body, err, content), timed
 
 
 def codex(root="~/.codex/sessions", days=30, mcp_only=True, harness=False):
@@ -219,7 +231,14 @@ def codex(root="~/.codex/sessions", days=30, mcp_only=True, harness=False):
                     text = _text(raw_out)
                     err = _codex_error(raw_out, text)
                     if cid not in results or (results[cid]["end_ns"] is None and t is not None):
-                        results[cid] = _result(t, text, err)
-    for cid, (span, result) in items.items():
+                        results[cid] = _result(t, text, err, raw_out)
+    for cid, (span, result, timed) in items.items():
+        if not timed:
+            # No timing on the completed item: keep timestamps reconstructed from the call/output pair.
+            if cid in calls:
+                span = calls[cid]
+            paired = results.get(cid)
+            if paired and paired["end_ns"] is not None:
+                result = dict(result, end_ns=paired["end_ns"])
         calls[cid], results[cid] = span, result
     return _reconcile(calls, results, days)
